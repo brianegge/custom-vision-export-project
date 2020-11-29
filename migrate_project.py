@@ -5,21 +5,29 @@ import sys
 import time
 
 import argparse
+import json
+import requests
 
 from azure.cognitiveservices.vision.customvision.training import CustomVisionTrainingClient
 from azure.cognitiveservices.vision.customvision.training.models import ImageUrlCreateBatch, ImageUrlCreateEntry, Region
 
-def migrate_tags(src_trainer, dest_trainer, project_id, dest_project_id):
+def migrate_tags(src_trainer, dest_trainer, project_id, dest_project):
     tags =  src_trainer.get_tags(project_id)
     print ("Found:", len(tags), "tags")
     # Re-create all of the tags and store them for look-up
     created_tags = {}
-    for tag in src_trainer.get_tags(project_id):
-        print ("Creating tag:", tag.name, tag.id)
-        created_tags[tag.id] = dest_trainer.create_tag(dest_project_id, tag.name, description=tag.description, type=tag.type).id
-    return created_tags
+    if dest_trainer:
+        for tag in src_trainer.get_tags(project_id):
+            print ("Creating tag:", tag.name, tag.id)
+            created_tags[tag.id] = dest_trainer.create_tag(dest_project.id, tag.name, description=tag.description, type=tag.type).id
+            return created_tags
+    else:
+        with open('tags.json', 'w') as fp:
+            t = {x.id:x.name for x in tags}
+            json.dump(t, fp)
+        return t
 
-def migrate_images(src_trainer, dest_trainer, project_id, dest_project_id, created_tags):
+def migrate_images(src_trainer, dest_trainer, project_id, dest_project, created_tags):
     # Migrate any tagged images that may exist and preserve their tags and regions.
     count = src_trainer.get_tagged_image_count(project_id)
     print ("Found:",count,"tagged images.")
@@ -33,9 +41,11 @@ def migrate_images(src_trainer, dest_trainer, project_id, dest_project_id, creat
             print ("Migrating", i.id, i.original_image_uri)
             if i.regions:
                 regions = []
+                tag_ids = []
                 for r in i.regions:
                     print ("Found region:", r.region_id, r.tag_id, r.left, r.top, r.width, r.height)
                     regions.append(Region(tag_id=created_tags[r.tag_id], left=r.left, top=r.top, width=r.width, height=r.height))
+                    tag_ids.append(created_tags[r.tag_id])
                 entry = ImageUrlCreateEntry(url=i.original_image_uri, regions=regions)
             else:
                 tag_ids = []
@@ -45,13 +55,17 @@ def migrate_images(src_trainer, dest_trainer, project_id, dest_project_id, creat
                 entry = ImageUrlCreateEntry(url=i.original_image_uri, tag_ids=tag_ids)
 
             images_to_upload.append(entry)
+            r = requests.get(i.original_image_uri)
+            with open('images/{}-{}.jpg'.format(i.id, "_".join(tag_ids)), 'wb') as f:
+                f.write(r.content)
 
-        upload_result = dest_trainer.create_images_from_urls(dest_project_id, images=images_to_upload)
-        if not upload_result.is_batch_successful:
-            print ("ERROR: Failed to upload image batch")
-            for i in upload_result.images:
-                print ("\tImage status:", i.id, i.status)
-            exit(-1)
+        if dest_trainer:
+            upload_result = dest_trainer.create_images_from_urls(dest_project.id, images=images_to_upload)
+            if not upload_result.is_batch_successful:
+                print ("ERROR: Failed to upload image batch")
+                for i in upload_result.images:
+                    print ("\tImage status:", i.id, i.status)
+                exit(-1)
 
         migrated += count_to_migrate
         count -= count_to_migrate
@@ -69,7 +83,7 @@ def migrate_images(src_trainer, dest_trainer, project_id, dest_project_id, creat
             print ("Migrating", i.id, i.original_image_uri)
             images_to_upload.append(ImageUrlCreateEntry(url=i.original_image_uri))
 
-        upload_result = dest_trainer.create_images_from_urls(dest_project_id, images=images_to_upload)
+        upload_result = dest_trainer.create_images_from_urls(dest_project.id, images=images_to_upload)
         if not upload_result.is_batch_successful:
             print ("ERROR: Failed to upload image batch")
             for i in upload_result.images:
@@ -97,11 +111,12 @@ if __name__ == "__main__":
     arg_parser.add_argument("-p", "--project", action="store", type=str, help="Source project ID", dest="project_id", default=None)
     arg_parser.add_argument("-s", "--src", action="store", type=str, help="Source Training-Key", dest="source_training_key", default=None)
     arg_parser.add_argument("-se", "--src_endpoint", action="store", type=str, help="Source Endpoint", dest="source_endpoint", default="https://southcentralus.api.cognitive.microsoft.com")
+    arg_parser.add_argument("-l", "--local", action='store_true', help="Copy project locally")
     arg_parser.add_argument("-d", "--dest", action="store", type=str, help="Destination Training-Key", dest="destination_training_key", default=None)
     arg_parser.add_argument("-de", "--dest_endpoint", action="store", type=str, help="Destination Endpoint", dest="destination_endpoint", default="https://southcentralus.api.cognitive.microsoft.com")
     args = arg_parser.parse_args()
 
-    if (not args.project_id or not args.source_training_key or not args.destination_training_key):
+    if (not args.project_id or not args.source_training_key):
         arg_parser.print_help()
         exit(-1)
 
@@ -111,8 +126,14 @@ if __name__ == "__main__":
     src_trainer = CustomVisionTrainingClient(args.source_training_key, endpoint=args.source_endpoint)
 
     # Client for Destination
-    dest_trainer = CustomVisionTrainingClient(args.destination_training_key, endpoint=args.destination_endpoint)
+    if args.local:
+        dest_trainer = None
+    else:
+        dest_trainer = CustomVisionTrainingClient(args.destination_training_key, endpoint=args.destination_endpoint)
 
-    destination_project = migrate_project(src_trainer, dest_trainer, args.project_id)
-    tags = migrate_tags(src_trainer, dest_trainer, args.project_id, destination_project.id)
-    source_images = migrate_images(src_trainer, dest_trainer, args.project_id, destination_project.id, tags)
+    if dest_trainer:
+        destination_project = migrate_project(src_trainer, dest_trainer, args.project_id)
+    else:
+        destination_project = None
+    tags = migrate_tags(src_trainer, dest_trainer, args.project_id, destination_project)
+    source_images = migrate_images(src_trainer, dest_trainer, args.project_id, destination_project, tags)
