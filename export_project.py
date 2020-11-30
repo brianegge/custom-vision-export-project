@@ -3,13 +3,20 @@
 import os
 import sys
 import time
+import pathlib
 
 import argparse
 import json
 import requests
 
+import xml.etree.ElementTree as ET
+from PIL import Image
+from io import BytesIO
+from xml.dom import minidom
+
 from azure.cognitiveservices.vision.customvision.training import CustomVisionTrainingClient
 from azure.cognitiveservices.vision.customvision.training.models import ImageUrlCreateBatch, ImageUrlCreateEntry, Region
+
 
 def migrate_tags(src_trainer, dest_trainer, project_id, dest_project):
     tags =  src_trainer.get_tags(project_id)
@@ -22,7 +29,7 @@ def migrate_tags(src_trainer, dest_trainer, project_id, dest_project):
             created_tags[tag.id] = dest_trainer.create_tag(dest_project.id, tag.name, description=tag.description, type=tag.type).id
             return created_tags
     else:
-        with open('tags.json', 'w') as fp:
+        with open('export/tags.json', 'w') as fp:
             t = {x.id:x.name for x in tags}
             json.dump(t, fp)
         return t
@@ -55,9 +62,46 @@ def migrate_images(src_trainer, dest_trainer, project_id, dest_project, created_
                 entry = ImageUrlCreateEntry(url=i.original_image_uri, tag_ids=tag_ids)
 
             images_to_upload.append(entry)
-            r = requests.get(i.original_image_uri)
-            with open('images/{}-{}.jpg'.format(i.id, "_".join(tag_ids)), 'wb') as f:
-                f.write(r.content)
+            image_file = '{}-{}.jpg'.format(i.id, "_".join(tag_ids))
+            xml_file = '{}-{}.xml'.format(i.id, "_".join(tag_ids))
+            image = None
+            if not os.path.exists('export/' + image_file):
+                r = requests.get(i.original_image_uri)
+                with open('export/' + image_file, 'wb') as f:
+                    f.write(r.content)
+                    image = Image.open(BytesIO(r.content))
+            else:
+                image = Image.open('export/' + image_file)
+            w, h = image.size
+            annotation = ET.Element('annotation')
+            folder = ET.SubElement(annotation, 'folder')
+            filename = ET.SubElement(annotation, 'filename')
+            filename.text = image_file
+            path = ET.SubElement(annotation, 'path')
+            path.text = image_file
+            source = ET.SubElement(annotation, 'source')
+            database = ET.SubElement(source, 'database')
+            database.text = 'Egge'
+            size = ET.SubElement(annotation, 'size')
+            ET.SubElement(size, 'width').text = str(w)
+            ET.SubElement(size, 'height').text = str(h)
+            ET.SubElement(size, 'depth').text = '3'
+            ET.SubElement(annotation, 'segmented').text = '0'
+            for r in i.regions:
+                _object = ET.SubElement(annotation, 'object')
+                ET.SubElement(_object, 'name').text = created_tags[r.tag_id]
+                ET.SubElement(_object, 'pose').text= 'Unspecified'
+                ET.SubElement(_object, 'truncated').text = '0'
+                ET.SubElement(_object, 'difficult').text = '0'
+                ET.SubElement(_object, 'occluded').text = '0'
+                bndbox = ET.SubElement(_object, 'bndbox')
+                ET.SubElement(bndbox, 'xmin').text = str(int(r.left * w))
+                ET.SubElement(bndbox, 'xmax').text = str(int((r.left + r.width) * w))
+                ET.SubElement(bndbox, 'ymin').text = str(int(r.top * h))
+                ET.SubElement(bndbox, 'ymax').text = str(int((r.top + r.height) * h))
+            xmlstr = minidom.parseString(ET.tostring(annotation)).toprettyxml(indent="   ")
+            with open('export/' + xml_file, "wb") as f:
+                f.write(xmlstr.encode('utf-8'))
 
         if dest_trainer:
             upload_result = dest_trainer.create_images_from_urls(dest_project.id, images=images_to_upload)
@@ -111,7 +155,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("-p", "--project", action="store", type=str, help="Source project ID", dest="project_id", default=None)
     arg_parser.add_argument("-s", "--src", action="store", type=str, help="Source Training-Key", dest="source_training_key", default=None)
     arg_parser.add_argument("-se", "--src_endpoint", action="store", type=str, help="Source Endpoint", dest="source_endpoint", default="https://southcentralus.api.cognitive.microsoft.com")
-    arg_parser.add_argument("-l", "--local", action='store_true', help="Copy project locally")
+    arg_parser.add_argument("-x", "--export", action='store_true', help="Export project locally in Pascal VOC format")
     arg_parser.add_argument("-d", "--dest", action="store", type=str, help="Destination Training-Key", dest="destination_training_key", default=None)
     arg_parser.add_argument("-de", "--dest_endpoint", action="store", type=str, help="Destination Endpoint", dest="destination_endpoint", default="https://southcentralus.api.cognitive.microsoft.com")
     args = arg_parser.parse_args()
@@ -126,7 +170,8 @@ if __name__ == "__main__":
     src_trainer = CustomVisionTrainingClient(args.source_training_key, endpoint=args.source_endpoint)
 
     # Client for Destination
-    if args.local:
+    if args.export:
+        pathlib.Path("export").mkdir(parents=True, exist_ok=True)
         dest_trainer = None
     else:
         dest_trainer = CustomVisionTrainingClient(args.destination_training_key, endpoint=args.destination_endpoint)
